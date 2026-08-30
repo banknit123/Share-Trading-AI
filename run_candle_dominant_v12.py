@@ -13,7 +13,6 @@ from run_historical_multimodal_v10 import load_events, add_news_features, NEWS_F
 ROUND_TRIP_COST = 0.0012
 HORIZONS = {"60m": 12, "120m": 24}
 
-# Fixed architecture weights requested by design: candles dominate the decision.
 W_CANDLE = 0.70
 W_MARKET = 0.20
 W_NEWS = 0.10
@@ -41,8 +40,11 @@ def _to_utc(df: pd.DataFrame) -> pd.DataFrame:
     idx = pd.DatetimeIndex(out.index)
     if idx.tz is None:
         idx = idx.tz_localize("Asia/Kolkata")
-    out.index = idx.tz_convert("UTC")
-    return out
+    idx = idx.tz_convert("UTC").floor("5min")
+    out.index = idx
+    if out.index.has_duplicates:
+        out = out.groupby(level=0).last()
+    return out.sort_index()
 
 
 def add_candle_features(raw: pd.DataFrame) -> pd.DataFrame:
@@ -94,36 +96,44 @@ def add_candle_features(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 def benchmark_features() -> pd.DataFrame:
-    b = add_intraday_features_v2(
-        _to_utc(download_history(DEFAULT_CONFIG.benchmark, period="60d", interval="5m"))
-    ).sort_index()
-    keep = pd.DataFrame(index=b.index)
-    keep["nifty_ret_1"] = b["ret_1"]
-    keep["nifty_ret_3"] = b["ret_3"]
-    keep["nifty_ret_6"] = b["ret_6"]
-    keep["nifty_ret_12"] = b["ret_12"]
-    keep["nifty_vol_12"] = b["volatility_12"]
-    keep["nifty_vwap_distance"] = b["vwap_distance"]
-    return keep
+    """Build a robust contemporaneous market proxy from the liquid NSE universe.
+
+    The Yahoo NIFTY 5-minute series can arrive with timestamp conventions that do
+    not line up with the equity series. To prevent the market layer from vanishing,
+    v12 uses the cross-sectional median of the same liquid NSE universe as a broad
+    market proxy. Only current/past bars are used; no future information enters.
+    """
+    pieces = []
+    for symbol in DEFAULT_CONFIG.universe:
+        raw = _to_utc(download_history(symbol, period="60d", interval="5m"))
+        f = add_intraday_features_v2(raw).sort_index()
+        sub = f[["ret_1", "ret_3", "ret_6", "ret_12", "volatility_12", "vwap_distance"]].copy()
+        pieces.append(sub)
+
+    if not pieces:
+        raise RuntimeError("Could not build market proxy: no universe data")
+
+    stack = pd.concat(pieces)
+    proxy = stack.groupby(level=0).median(numeric_only=True).sort_index()
+    proxy = proxy.rename(columns={
+        "ret_1": "nifty_ret_1",
+        "ret_3": "nifty_ret_3",
+        "ret_6": "nifty_ret_6",
+        "ret_12": "nifty_ret_12",
+        "volatility_12": "nifty_vol_12",
+        "vwap_distance": "nifty_vwap_distance",
+    })
+    return proxy
 
 
 def _align_benchmark(stock: pd.DataFrame, bench: pd.DataFrame) -> pd.DataFrame:
-    """Align benchmark bars to stock bars without requiring byte-for-byte timestamp equality.
-
-    Yahoo intraday series can occasionally differ by a few seconds/minutes between
-    symbols. Exact inner joins therefore can erase an otherwise valid panel. We
-    align each stock bar to the nearest benchmark observation within 3 minutes.
-    """
-    aligned = bench.reindex(
-        stock.index,
-        method="nearest",
-        tolerance=pd.Timedelta(minutes=3),
-    )
+    aligned = bench.reindex(stock.index, method="nearest", tolerance=pd.Timedelta(minutes=3))
     return stock.join(aligned)
 
 
 def build_panel(events_by_symbol: dict[str, pd.DataFrame]) -> pd.DataFrame:
     bench = benchmark_features()
+    print(f"Market proxy bars: {len(bench)} using {len(DEFAULT_CONFIG.universe)} NSE stocks")
     frames = []
     for symbol in DEFAULT_CONFIG.universe:
         raw = _to_utc(download_history(symbol, period="60d", interval="5m"))
@@ -152,18 +162,14 @@ def build_panel(events_by_symbol: dict[str, pd.DataFrame]) -> pd.DataFrame:
 
     panel = pd.concat(frames).replace([np.inf, -np.inf], np.nan)
     needed = CANDLE_FEATURES + MARKET_FEATURES + NEWS_FEATURES + [f"future_{h}" for h in HORIZONS]
-
-    # Give a useful diagnostic before dropping rows.
     missing_all = [c for c in needed if c not in panel.columns or panel[c].notna().sum() == 0]
     if missing_all:
         raise RuntimeError(f"Features with zero usable observations: {missing_all}")
 
     panel = panel.dropna(subset=needed).sort_values(["timestamp", "symbol"])
     if panel.empty:
-        null_rates = panel if False else None
         raise RuntimeError(
-            "Panel became empty after feature filtering. Check per-symbol market_aligned counts above; "
-            "benchmark timestamp alignment or an all-NaN feature is the likely cause."
+            "Panel became empty after feature filtering. Check market_aligned counts and feature diagnostics above."
         )
     return panel
 
@@ -227,6 +233,7 @@ def main() -> None:
     print("No trades are placed.")
     print(f"Decision architecture: {W_CANDLE:.0%} candle + {W_MARKET:.0%} market + {W_NEWS:.0%} news")
     print("Candles remain the primary signal; news is only a secondary context layer.")
+    print("Market context uses a contemporaneous equal-weight/median liquid-NSE proxy.")
     print("Live trading enabled:", DEFAULT_CONFIG.live_trading_enabled)
 
     events = load_events()
