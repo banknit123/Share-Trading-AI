@@ -71,8 +71,18 @@ def cross_sectional_metrics(score: np.ndarray, df: pd.DataFrame, raw_target: str
             ic = g["score"].corr(g[excess_target], method="spearman")
             if pd.notna(ic):
                 rank_ics.append(float(ic))
-        top = g.loc[g["score"].idxmax()]
-        bottom = g.loc[g["score"].idxmin()]
+
+        # Each stock frame retains the timestamp as its DataFrame index, so those
+        # index labels are duplicated across symbols. Using idxmax()/loc therefore
+        # can return multiple rows. Reset the group to a positional index and use
+        # argmax/argmin so exactly one deterministic scalar row is selected.
+        gg = g.reset_index(drop=True)
+        scores = gg["score"].to_numpy(dtype=float)
+        top_pos = int(np.argmax(scores))
+        bottom_pos = int(np.argmin(scores))
+        top = gg.iloc[top_pos]
+        bottom = gg.iloc[bottom_pos]
+
         top_excess.append(float(top[excess_target]))
         bottom_excess.append(float(bottom[excess_target]))
         top_raw.append(float(top[raw_target]))
