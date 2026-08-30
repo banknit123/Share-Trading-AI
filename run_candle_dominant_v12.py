@@ -94,7 +94,9 @@ def add_candle_features(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 def benchmark_features() -> pd.DataFrame:
-    b = add_intraday_features_v2(_to_utc(download_history(DEFAULT_CONFIG.benchmark, period="60d", interval="5m")))
+    b = add_intraday_features_v2(
+        _to_utc(download_history(DEFAULT_CONFIG.benchmark, period="60d", interval="5m"))
+    ).sort_index()
     keep = pd.DataFrame(index=b.index)
     keep["nifty_ret_1"] = b["ret_1"]
     keep["nifty_ret_3"] = b["ret_3"]
@@ -105,12 +107,31 @@ def benchmark_features() -> pd.DataFrame:
     return keep
 
 
+def _align_benchmark(stock: pd.DataFrame, bench: pd.DataFrame) -> pd.DataFrame:
+    """Align benchmark bars to stock bars without requiring byte-for-byte timestamp equality.
+
+    Yahoo intraday series can occasionally differ by a few seconds/minutes between
+    symbols. Exact inner joins therefore can erase an otherwise valid panel. We
+    align each stock bar to the nearest benchmark observation within 3 minutes.
+    """
+    aligned = bench.reindex(
+        stock.index,
+        method="nearest",
+        tolerance=pd.Timedelta(minutes=3),
+    )
+    return stock.join(aligned)
+
+
 def build_panel(events_by_symbol: dict[str, pd.DataFrame]) -> pd.DataFrame:
     bench = benchmark_features()
     frames = []
     for symbol in DEFAULT_CONFIG.universe:
         raw = _to_utc(download_history(symbol, period="60d", interval="5m"))
-        f = add_candle_features(raw).join(bench, how="inner")
+        f = add_candle_features(raw).sort_index()
+        before_align = len(f)
+        f = _align_benchmark(f, bench)
+        aligned_market = int(f["nifty_ret_1"].notna().sum()) if len(f) else 0
+
         f["rel_ret_1"] = f["ret_1"] - f["nifty_ret_1"]
         f["rel_ret_3"] = f["ret_3"] - f["nifty_ret_3"]
         f["rel_ret_6"] = f["ret_6"] - f["nifty_ret_6"]
@@ -122,17 +143,35 @@ def build_panel(events_by_symbol: dict[str, pd.DataFrame]) -> pd.DataFrame:
             f[f"future_{name}"] = f["Close"].shift(-bars) / f["Close"] - 1.0
         frames.append(f)
         print(
-            f"{symbol:15} rows={len(f):5d} news60={(f['news_count_60m'] > 0).sum():4d} "
-            f"ret6_avg={f['ret_6'].mean():+.3%}"
+            f"{symbol:15} rows={len(f):5d} stock_bars={before_align:5d} market_aligned={aligned_market:5d} "
+            f"news60={(f['news_count_60m'] > 0).sum():4d} ret6_avg={f['ret_6'].mean():+.3%}"
         )
+
+    if not frames:
+        raise RuntimeError("No stock frames were built")
 
     panel = pd.concat(frames).replace([np.inf, -np.inf], np.nan)
     needed = CANDLE_FEATURES + MARKET_FEATURES + NEWS_FEATURES + [f"future_{h}" for h in HORIZONS]
-    return panel.dropna(subset=needed).sort_values(["timestamp", "symbol"])
+
+    # Give a useful diagnostic before dropping rows.
+    missing_all = [c for c in needed if c not in panel.columns or panel[c].notna().sum() == 0]
+    if missing_all:
+        raise RuntimeError(f"Features with zero usable observations: {missing_all}")
+
+    panel = panel.dropna(subset=needed).sort_values(["timestamp", "symbol"])
+    if panel.empty:
+        null_rates = panel if False else None
+        raise RuntimeError(
+            "Panel became empty after feature filtering. Check per-symbol market_aligned counts above; "
+            "benchmark timestamp alignment or an all-NaN feature is the likely cause."
+        )
+    return panel
 
 
 def split_time(panel: pd.DataFrame):
     times = np.array(sorted(panel["timestamp"].unique()))
+    if len(times) < 10:
+        raise RuntimeError(f"Too few unique timestamps for train/validation/test split: {len(times)}")
     t1 = times[int(len(times) * 0.60)]
     t2 = times[int(len(times) * 0.80)]
     return (
