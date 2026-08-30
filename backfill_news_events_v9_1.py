@@ -4,7 +4,7 @@ from datetime import date, timedelta
 import time
 
 from trading_ai.config import DEFAULT_CONFIG
-from trading_ai.data.event_store import EventStore, StoredEvent
+from trading_ai.data.event_store import StoredEvent, counts, insert_events
 from trading_ai.data.rss_news import search_google_news_rss
 from run_news_coverage_audit_v6_1 import QUERY_MAP
 
@@ -28,9 +28,6 @@ def main() -> None:
     print("No trades are placed. This backfills historical headlines into the local event database.")
     print("Source: Google News RSS date-window queries; no API key required.")
     print("Live trading enabled:", DEFAULT_CONFIG.live_trading_enabled)
-
-    store = EventStore("data/news_events.sqlite3")
-    store.initialize()
 
     total_fetched = 0
     total_new = 0
@@ -59,26 +56,29 @@ def main() -> None:
                 time.sleep(0.5)
                 continue
 
+            events: list[StoredEvent] = []
             for article in articles:
                 if article.published_at is None or not article.title.strip():
                     continue
                 symbol_fetched += 1
                 total_fetched += 1
-                event = StoredEvent(
-                    symbol=symbol,
-                    provider="RSS",
-                    title=article.title.strip(),
-                    url=article.url,
-                    domain=article.domain,
-                    published_at=article.published_at,
+                events.append(
+                    StoredEvent(
+                        symbol=symbol,
+                        provider="RSS",
+                        title=article.title.strip(),
+                        url=article.url or "",
+                        domain=article.domain or "",
+                        published_at=article.published_at,
+                    )
                 )
-                inserted = store.insert_event(event)
-                if inserted:
-                    symbol_new += 1
-                    total_new += 1
-                else:
-                    symbol_dup += 1
-                    total_duplicates += 1
+
+            if events:
+                inserted, skipped = insert_events(events)
+                symbol_new += inserted
+                symbol_dup += skipped
+                total_new += inserted
+                total_duplicates += skipped
 
             time.sleep(0.15)
 
@@ -87,14 +87,14 @@ def main() -> None:
             f"duplicates={symbol_dup:4d} failed_windows={symbol_failed}"
         )
 
-    stats = store.stats()
+    total_events, symbols_covered = counts()
     print("\nBackfill summary")
     print(f"Fetched candidate headlines: {total_fetched}")
     print(f"New events added: {total_new}")
     print(f"Duplicates skipped: {total_duplicates}")
     print(f"Failed date windows: {failed_windows}")
-    print(f"Database total events: {stats['total_events']}")
-    print(f"Database symbols covered: {stats['symbols_covered']}/{len(DEFAULT_CONFIG.universe)}")
+    print(f"Database total events: {total_events}")
+    print(f"Database symbols covered: {symbols_covered}/{len(DEFAULT_CONFIG.universe)}")
     print("Database: data/news_events.sqlite3")
     print("Run the normal v9 collector afterward to keep the database current.")
 
